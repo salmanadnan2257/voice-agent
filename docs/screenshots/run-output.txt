@@ -1,0 +1,28 @@
+$ python -m eval.run_eval
+[PASS] (book) book_simple_one_shot
+[PASS] (book) book_multi_turn_slot_filling
+[PASS] (book) book_explicit_duration_one_hour
+[PASS] (book) book_explicit_phone_override
+[PASS] (book) book_reject_confirmation_then_correct
+[PASS] (reschedule) reschedule_success
+[PASS] (reschedule) reschedule_not_found_then_abandoned
+[PASS] (cancel) cancel_success
+[PASS] (cancel) cancel_not_found_then_abandoned
+[PASS] (conflict) double_booking_conflict
+[PASS] (ambiguous_time) ambiguous_time_then_clarified
+[PASS] (ambiguous_time) ambiguous_date_then_clarified
+[PASS] (unclear_speech) unclear_speech_recovers
+[PASS] (unclear_speech) unclear_speech_retry_cap_handoff
+[PASS] (abandoned) abandoned_call_status_callback
+[PASS] (book) business_hours_rejection_too_early
+[PASS] (book) business_hours_rejection_too_late
+[PASS] (book) past_date_rejection_then_corrected
+[PASS] (conflict) boundary_adjacent_appointments_no_conflict
+[PASS] (conflict) overlapping_partial_conflict
+[PASS] (book) mid_call_change_of_mind
+[PASS] (book) multiple_independent_bookings
+[PASS] (book) goodbye_after_success_keeps_outcome
+[PASS] (unclear_speech) max_turn_cap_handoff
+[PASS] (conflict) reschedule_conflict_then_alternate
+
+25/25 scenarios passed
