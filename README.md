@@ -271,6 +271,7 @@ incurred is $0.00. No changes were made to the live phone number's configuration
    `/voice/gather` exactly; it actually returns `http://testserver/voice/gather` when no
    `PUBLIC_WEBHOOK_BASE_URL` is configured (the real fallback behavior, not a bug), caught
    by an actual failing pytest run. Fixed the test's assertion, not the code.
+- **Writing the exhaustive project documentation honestly.** This project didn't have a git repository yet when documentation started, unlike its siblings, so setting one up (with a proper .gitignore and a first-ever secret scan) had to happen before anything could be committed. The first documentation attempt also stalled and had to be redone.
 
 ## What I learned
 
