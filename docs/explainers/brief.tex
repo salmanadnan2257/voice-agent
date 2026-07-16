@@ -1,0 +1,398 @@
+% explainer-source-hash: e86e98979cf8c7389d590088e201dc0e7817163aa2a1f304cecfbf7c32a770ce
+% explainer-source-commit: 3f1d18ace6744e68643813b24e0dc406bd4e6c7c
+% explainer-generated: 2026-07-16
+% Regenerate with /explain-all (see WIRING.md). Do not edit this stamp by hand:
+% it is how the toolchain knows whether this document still matches the code.
+\documentclass[11pt,a4paper]{article}
+\input{preamble}
+
+\title{\textbf{Voice Appointment Agent}\\[0.3em]
+\large A Brief: the design, the evidence, and the gaps}
+\author{Portfolio explainer, built from the repository source}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\section{The project in one page}
+
+A small business loses money every time nobody answers the phone. This project is a working
+answer: a real telephone number a person can speak to in ordinary sentences, which books,
+reschedules, and cancels appointments in a real calendar.
+
+Three off-the-shelf pieces, one piece of original work:
+
+\begin{itemize}
+  \item \textbf{Twilio} rents the phone line, answers the call, converts speech to text, and
+  speaks replies back.
+  \item \textbf{Gemini 2.5 Flash} reads each caller utterance and returns structured data:
+  what they want, and the details extracted so far.
+  \item \textbf{SQLite} stores appointments and refuses to double-book.
+  \item \textbf{The original work} is the state machine in between, plus the architecture that
+  makes an LLM-driven phone system testable without spending money on every run.
+\end{itemize}
+
+\begin{keyidea}{The claim to make, and its exact boundary}
+The booking logic is thoroughly and genuinely verified: 47 free automated tests and 25 scripted
+conversation scenarios, all passing, all reproduced independently while writing this document.
+
+What is \emph{not} verified is that this survives a real human voice. The language model has
+only ever been shown clean, typed English; Twilio's speech-to-text output is noisier. That gap
+is real, and the project's README states it plainly rather than glossing it.
+\end{keyidea}
+
+\section{Architecture}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.96\textwidth}{!}{
+\begin{tikzpicture}[node distance=10mm]
+  \node[extbox, text width=20mm] (caller) {Caller\\{\scriptsize on a phone}};
+  \node[extbox, right=26mm of caller, text width=24mm] (twilio) {\textbf{Twilio}\\{\scriptsize speech $\leftrightarrow$ text}};
+  \node[box, right=26mm of twilio, text width=30mm] (app) {\textbf{app.py}\\{\scriptsize FastAPI: answers}\\{\scriptsize Twilio's webhooks}\\{\scriptsize with TwiML}};
+  \node[box, right=26mm of app, text width=32mm] (conv) {\textbf{conversation.py}\\{\scriptsize the state machine:}\\{\scriptsize ALL business logic}};
+  \node[box, below left=16mm and 2mm of conv] (ie) {\code{IntentEngine}\\{\scriptsize\itshape interface}};
+  \node[box, below right=16mm and 2mm of conv] (cs) {\code{CalendarStore}\\{\scriptsize\itshape interface}};
+  \node[extbox, below=12mm of ie] (gem) {\textbf{Gemini 2.5 Flash}\\{\scriptsize billed per call}};
+  \node[store, below=12mm of cs] (db) {\textbf{SQLite}\\{\scriptsize appointments}};
+  \node[store, above=13mm of conv] (sess) {\textbf{session\_store}\\{\scriptsize per-call memory}};
+
+  % forward path: labels above the line
+  \draw[flow] (caller) -- node[lbl,above]{voice} (twilio);
+  \draw[flow] (twilio) -- node[lbl,above]{HTTP POST\\{\scriptsize per turn}} (app);
+  \draw[flow] (app) -- node[lbl,above]{one\\utterance} (conv);
+  \draw[flow] (conv) -- (ie);
+  \draw[flow] (conv) -- (cs);
+  \draw[flow] (ie) -- (gem);
+  \draw[flow] (cs) -- (db);
+  \draw[flow] (conv) -- node[lbl,right]{save} (sess);
+  % return path: arcs below the row, clear of the boxes
+  \draw[dflow] (conv) to[bend left=32] node[lbl,below]{reply text} (app);
+  \draw[dflow] (app) to[bend left=32] node[lbl,below]{TwiML} (twilio);
+  \draw[dflow] (twilio) to[bend left=32] node[lbl,below]{spoken reply} (caller);
+\end{tikzpicture}}
+\caption{\code{conversation.py} holds every business rule and depends on \emph{neither} Twilio
+\emph{nor} Gemini. It talks only to the two interfaces. That is the whole design.}
+\end{figure}
+
+\subsection{The decision everything else rests on}
+
+The conversation manager is handed its collaborators rather than creating them, and it only
+ever knows them as \code{IntentEngine} and \code{CalendarStore}. So the identical state machine
+runs in three worlds:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Where} & \textbf{Language model} & \textbf{Calendar} & \textbf{Cost per run} \\
+\midrule
+Production (uvicorn) & real Gemini, billed & SQLite file & real money \\
+47 pytest tests & scripted double & temp SQLite & nothing \\
+25 eval scenarios & scripted double & temp SQLite & nothing \\
+6 marked tests & \textbf{real Gemini} & not involved & a fraction of a cent \\
+\bottomrule
+\end{tabular}
+\caption{One state machine, four wirings. The expensive dependency is present exactly where it
+must be proven, and absent everywhere else.}
+\end{table}
+
+\begin{keyidea}{Why this is the strongest thing in the project}
+25 scenarios, several of them five turns long, would be over 100 billed model calls per run,
+would take real time, and would be flaky, because language models are not deterministic.
+Defining what the manager \emph{needs} rather than what it will \emph{use} converts an
+unaffordable test suite into one that runs in under three seconds for free, and still exercises
+the real state machine, the real database, and real conflict detection.
+
+The discipline is what makes it credible: the fake engine lives in \file{eval/}, outside the
+production package, and its own docstring says ``This is a TEST DOUBLE, not a production
+fallback''. The shipped path always uses the real model, so the ``LLM-driven'' claim holds.
+\end{keyidea}
+
+\section{How a call works}
+
+A phone call is not one conversation from the server's point of view; it is a series of
+separate HTTP requests with no memory of each other. Everything the agent knows must therefore
+be written to SQLite and read back every turn, keyed by Twilio's \code{CallSid}. That single
+fact explains why \code{session\_store.py} exists at all.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.92\textwidth}{!}{
+\begin{tikzpicture}[node distance=6mm]
+  \node[box] (a) {Twilio POSTs \code{/voice/gather}\\{\scriptsize with the transcribed speech}};
+  \node[box, below=5mm of a] (b) {load session + transcript from SQLite\\{\scriptsize the server had forgotten everything}};
+  \node[box, below=5mm of b] (c) {\code{intent\_engine.parse\_turn(context)}\\{\scriptsize Gemini returns JSON: intent + slots + reply}};
+  \node[box, below=5mm of c] (d) {state machine merges slots, applies the rules};
+  \node[dec, below=6mm of d, text width=26mm] (e) {all slots filled\\AND confirmed?};
+  \node[box, right=16mm of e, fill=softgrey] (f) {ask the next\\question};
+  \node[box, below=7mm of e] (g) {validate: not past, within 9:00-17:00};
+  \node[box, below=5mm of g] (h) {\code{calendar\_store.book(...)}\\{\scriptsize conflict check, then INSERT}};
+  \node[box, below=5mm of h, fill=okgreen!12, draw=okgreen] (i) {reply with TwiML: \code{<Gather>} or \code{<Hangup>}};
+  \draw[flow] (a)--(b); \draw[flow] (b)--(c); \draw[flow] (c)--(d); \draw[flow] (d)--(e);
+  \draw[flow] (e) -- node[lbl,above]{no} (f);
+  \draw[flow] (f.south) |- (i.east);
+  \draw[flow] (e) -- node[lbl,left]{yes} (g);
+  \draw[flow] (g)--(h); \draw[flow] (h)--(i);
+\end{tikzpicture}}
+\caption{One turn, end to end. Repeat until booked, hung up, or handed off.}
+\end{figure}
+
+\section{The engineering decisions worth defending}
+
+\subsection{Turning the language model's flagship feature off}
+
+Gemini 2.5 Flash ``thinks'' before answering by default. That helps hard reasoning and costs
+seconds. On a phone call, several seconds of dead air is a product failure: the caller assumes
+the line dropped. So the production configuration sets \code{thinking\_budget=0}, plus a strict
+response schema and \code{temperature=0.1}.
+
+\begin{keyidea}{The general lesson}
+The right configuration depends on the product, not on the model's defaults. For a live phone
+turn, latency beats depth. Knowing which clever feature to switch off is engineering; leaving
+defaults on is not.
+
+Equally: asking a model in prose to ``please reply in JSON'' sometimes yields ``Sure! Here's
+the JSON:'' and then fails to parse. Supplying a formal \code{response\_schema} to the API
+constrains the output structurally. That is the robust way to get machine-readable answers.
+\end{keyidea}
+
+\subsection{Reading the vendor documentation properly}
+
+Twilio's \code{<Gather>} requests your server \emph{only when it captures speech}. On silence
+it quietly moves on to the next instruction instead. The consequence would have been severe:
+every ``sorry, could you repeat that?'' retry path would be unreachable for a silent caller,
+who is precisely the caller who needs it. One attribute, \code{action\_on\_empty\_result=True},
+routes silence back through the same state machine. This is the class of detail that separates
+working telephony from a demo.
+
+\subsection{Two safety nets, for two different failures}
+
+\begin{itemize}
+  \item \textbf{Retry cap (3 consecutive unclear turns)} catches the bad line and the noisy room.
+  \item \textbf{Turn cap (14 total turns)} catches what the retry cap cannot: a caller whose
+  every turn is perfectly intelligible but never completes anything. Say ``sometime in the
+  morning'' forever and the retry counter resets every turn, because each turn was a valid
+  continuation. Without the second cap the call never ends.
+\end{itemize}
+
+The test for the turn cap asserts \code{retry\_count == 0}, proving \emph{which} mechanism
+saved the call rather than merely that something did. That is careful test design.
+
+\subsection{Making time an input}
+
+The conversation manager accepts an injectable clock (\code{now\_fn}) rather than calling
+\code{datetime.now()}. Without this, a test asserting ``the appointment lands on 2026-07-15''
+passes today and silently starts failing once that date passes, for reasons unrelated to any
+code change. Every scenario pins time to \code{FIXED\_NOW = 2026-07-06 13:00}, chosen at
+mid-afternoon so a same-day ``past'' time can be tested without also tripping the
+business-hours rule.
+
+\subsection{Half-open intervals}
+
+Conflict detection is \code{a\_start < b\_end and b\_start < a\_end}. Strictly less-than, so an
+appointment ending at 9:30 and one starting at 9:30 are back to back rather than in conflict,
+which is what a busy clinic needs. Using \code{<=} would refuse a perfectly good booking. There
+is a dedicated scenario for the boundary case.
+
+\section{The evidence}
+
+Every free number below was independently reproduced while writing this document, by installing
+the pinned requirements into a clean virtual environment and running the suite. The 7 tests that
+spend money were collected but \textbf{deliberately never executed}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Claim} & \textbf{Observed} & \textbf{Verdict} \\
+\midrule
+54 tests collected & \code{54 tests collected} & confirmed \\
+47 free, 7 billed & \code{47 passed, 7 deselected} & confirmed \\
+25/25 scenarios pass & \code{25/25 scenarios passed} & confirmed \\
+Clean venv install & exit code 0 & confirmed \\
+Latency 1.8 s with thinking off & no artefact in repo & \emph{owner's record} \\
+Live public-tunnel booking & no artefact in repo & \emph{owner's record} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{What the 25 scenarios actually test}
+
+\begin{keyidea}{Precisely, because the honest answer is narrower than it sounds}
+\textbf{Genuinely exercised:} the real state machine, a real SQLite calendar on a real
+temporary file, real conflict detection, real business-hours and past-date validation, real
+retry and turn caps. Coverage spans booking (one-shot and multi-turn), rescheduling,
+cancelling, conflicts, boundary-adjacent slots, ambiguous times and dates, unclear speech,
+both safety caps, abandoned calls, and mid-call changes of mind.
+
+\textbf{Substituted:} the language model, replaced by the regex-based scripted double.
+
+\textbf{Not involved at all:} Twilio, FastAPI, HTTP, TwiML. Utterances are fed straight into
+the manager. Those layers are covered separately by 7 endpoint tests.
+
+So ``25/25'' is a strong statement about the booking \emph{logic} and no statement about
+speech recognition. That framing is the one to offer first.
+\end{keyidea}
+
+\subsection{The tests were themselves tested}
+
+A passing test proves nothing unless it can fail. The README claims the safety caps were
+deliberately broken to confirm the scenarios noticed. That was re-verified here in a scratch
+copy, leaving the repository untouched:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Sabotage} & \textbf{Result} & \textbf{Caught by} \\
+\midrule
+retry cap 3 $\rightarrow$ 999 & 24/25 & \code{unclear\_speech\_retry\_cap\_handoff} \\
+turn cap 14 $\rightarrow$ 9999 & 24/25 & \code{max\_turn\_cap\_handoff} \\
+\code{<} $\rightarrow$ \code{<=} in overlap & 24/25 & \code{boundary\_adjacent\_appointments\_no\_conflict} \\
+\bottomrule
+\end{tabular}
+\caption{Each sabotage killed exactly the one scenario named for it, and nothing else. The
+suite is load-bearing, not decorative.}
+\end{table}
+
+\begin{honest}{The scripted engine cannot fail to understand}
+The fake engine was written to handle exactly the phrases the scenarios use; its docstring
+concedes this. So no scenario can ever surface a misunderstanding. The 25 scenarios test the
+state machine \emph{given perfect understanding}. Real understanding is tested only by the 6
+marked Gemini tests, against clean typed English, and never against messy speech output.
+
+This is the correct trade, and the project is open about it. Say it first: ``25/25 proves the
+booking logic; I made the understanding layer a separate, smaller, honest experiment.''
+\end{honest}
+
+\section{Honest findings}
+
+Found by reading the source and confirmed by running the real code in a scratch copy. None of
+these appear in the README.
+
+\begin{honest}{The webhook signature check fails open by default}
+The most significant issue. Twilio signs each request so you can prove it came from Twilio.
+The check is implemented correctly, but it is wrapped in \code{if base\_url and auth\_token:},
+and \code{PUBLIC\_WEBHOOK\_BASE\_URL} is blank by default, with \file{.env.example} instructing
+``leave blank for local development''.
+
+Verified by driving the real app: with enforcement nominally \emph{on} and no base URL, a
+request carrying \emph{no signature at all} returns \textbf{HTTP 200}. Set the base URL and the
+same request correctly returns \textbf{403}.
+
+There is a real reason (Twilio signs the public URL, so without it there is nothing to check
+against). The problem is the direction of failure: a missing setting yields silently no
+security rather than a refusal to start. Deploy behind a real URL and forget the variable, and
+the booking endpoints are open to anyone. The fix is small: refuse to start, or make unsigned
+requests an explicit opt-in.
+\end{honest}
+
+\begin{honest}{Phone numbers are stored in two incompatible formats, and a test locks it in}
+Twilio gives caller ID as \code{+15551112222}; speech is parsed to bare digits
+\code{5551112222}; lookup is an exact string match. Verified: an appointment booked after the
+caller \emph{spoke} their number cannot be found when that person phones back. The caller who
+was most helpful is the one who cannot cancel.
+
+Sharpest detail: scenario 4 \emph{asserts this as correct}, checking that the caller-ID lookup
+returns zero results. Its intent (a spoken number should override caller ID) is right; what is
+missing is normalising both to one canonical format on input. A good example of a test encoding
+an assumption rather than a requirement.
+\end{honest}
+
+\begin{honest}{The wrong appointment is targeted when a caller has two}
+\code{list\_by\_phone} sorts furthest-future first, and the code takes the first match. Verified:
+with appointments on 2026-08-01 and 2026-09-01 under one number, ``cancel my appointment''
+targets \textbf{September}, keeping August. The agent does read the date back, so an attentive
+caller can object, but ``my appointment'' in ordinary speech means the next one. No scenario
+covers a caller with two active appointments, which is exactly why the suite stays green.
+\end{honest}
+
+\begin{honest}{The Google Calendar adapter has never run, and reading it shows why that matters}
+Fully implemented against the real Calendar API, selected automatically if credentials are set,
+but no credentials were ever provided. The README says so. Reading it reveals a concrete defect:
+\code{cancel()} deletes the event and then fabricates a return value using
+\code{datetime.now()}, and the conversation manager speaks that value back to the caller. On
+this backend the agent would announce \emph{the current time} instead of the appointment's real
+time. Invisible on SQLite, where \code{cancel()} returns the true row. That is the predictable
+cost of shipping code you cannot run.
+\end{honest}
+
+\begin{honest}{Smaller items}
+\begin{itemize}
+  \item \code{find\_conflict} loads \emph{every} booked appointment ever made into Python on
+  each booking, with no time filter and no index. Invisible at this scale; a one-line
+  \code{WHERE} clause away from correct.
+  \item \code{book()} checks for conflicts and inserts as two statements with no transaction, so
+  two simultaneous bookings could both pass the check. One phone line makes it vanishingly
+  unlikely, but ``why is your conflict check not atomic?'' is a fair question.
+  \item \code{SessionState.stage} is declared, serialised into every row, and never read or
+  written anywhere. Dead field from an earlier design.
+  \item \code{cancel()} on an already-cancelled appointment silently succeeds, though the
+  interface documents it as raising. Its sibling \code{reschedule()} does check. Inconsistent.
+  \item No timezones anywhere; every time is one implicit local zone. Acknowledged in the README.
+\end{itemize}
+\end{honest}
+
+\begin{honest}{Three claims rest on the owner's word}
+The 1.8 second latency measurement, the 56 thinking-token figure, and the live public-tunnel
+booking run all appear only in README prose; no log or artefact survives in the repository. The
+tunnel run is the strongest verification claimed and was cleaned up afterwards by design.
+Nothing suggests these are untrue, and the README's precision elsewhere argues the other way;
+it even labels its own cost figure ``an estimate from per-token rates, not a verified line-item
+invoice'', which is exactly right. But ``I ran it and here is the log'' and ``I ran it and
+cleaned up'' are different, and an interviewer may probe. Next time, commit the log.
+\end{honest}
+
+\section{Security posture}
+
+Secret hygiene is genuinely good. \file{.env} is a symbolic link pointing outside the
+repository to a private secrets directory, so no credential is ever in the working tree.
+The full git history (all 46 objects) was scanned for Twilio SIDs, Google API keys, private-key
+blocks, and hard-coded tokens: clean. \file{.env.example} carries placeholders only. Every SQL
+query is parameterised, which matters because a caller's spoken name reaches the database.
+Configuration values are never logged.
+
+The one real weakness is the fail-open signature check described above.
+
+\section{Summary judgement}
+
+\begin{keyidea}{Lead with these}
+\begin{enumerate}
+  \item \textbf{The interface seam.} Two small abstract classes turn an expensive,
+  non-deterministic system into one with 72 free, deterministic checks. Best thing here.
+  \item \textbf{Turning thinking mode off}, having measured it. Product engineering, not
+  cargo-culted defaults.
+  \item \textbf{The tests were tested.} Mutation testing reproduced exactly.
+  \item \textbf{\code{actionOnEmptyResult}.} Evidence of reading the documentation properly.
+  \item \textbf{The README's candour} about its own gaps exceeds most production documentation.
+\end{enumerate}
+\end{keyidea}
+
+\begin{keyidea}{Raise these before someone else does}
+\begin{enumerate}
+  \item The signature check fails open without the base URL.
+  \item Two phone formats, with a test that locks the bug in.
+  \item The furthest-future appointment is targeted, not the soonest.
+  \item ``25/25'' means the logic is right \emph{given perfect understanding}.
+  \item No timezones; the Google adapter has never run; no real voice call has been made.
+\end{enumerate}
+\end{keyidea}
+
+The honest one-line verdict: a well-architected demonstration of a real pattern, tested far
+more rigorously than most portfolio projects, whose remaining gap (a real human voice on a real
+line) is the one the author names first himself.
+
+\vfill
+\begin{center}
+\small\itshape
+Built from the repository source. Every claim is quoted from the code, verified by running it in
+an isolated scratch copy, or explicitly labelled as the owner's own record. No phone call was
+placed and no billed API test was executed in the making of this document.
+\end{center}
+
+\end{document}

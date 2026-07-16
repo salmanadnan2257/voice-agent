@@ -1,0 +1,1455 @@
+% explainer-source-hash: e86e98979cf8c7389d590088e201dc0e7817163aa2a1f304cecfbf7c32a770ce
+% explainer-source-commit: 3f1d18ace6744e68643813b24e0dc406bd4e6c7c
+% explainer-generated: 2026-07-16
+% Regenerate with /explain-all (see WIRING.md). Do not edit this stamp by hand:
+% it is how the toolchain knows whether this document still matches the code.
+\documentclass[11pt,a4paper]{article}
+\input{preamble}
+
+\title{\textbf{Voice Appointment Agent}\\[0.3em]
+\large A Deep Dive: how a phone call becomes a booked appointment}
+\author{Portfolio explainer, built from the repository source}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{keyidea}{The one-sentence version}
+Somebody phones a small business. Twilio answers the call and turns the caller's speech
+into text. That text is handed to Google's Gemini 2.5 Flash language model, which works out
+what the caller actually wants (book, reschedule, or cancel) and pulls out the details (name,
+date, time). A small database then really does book the appointment, refusing to
+double-book. The whole thing is designed so that the expensive parts (the phone line and the
+language model) can be unplugged and replaced with free stand-ins, which is why it can be
+tested 54 times over without spending money.
+\end{keyidea}
+
+\tableofcontents
+\newpage
+
+\section{What this project is, and what it is not}
+
+\subsection{The problem it addresses}
+
+A clinic, a salon, or a repair shop loses bookings when nobody picks up the phone. The
+caller does not leave a voicemail; the caller phones the next business on the list. The
+traditional fix is a ``phone tree'' (``press 1 for bookings''), which callers dislike and
+which cannot handle a sentence like ``can you move my Tuesday thing to Thursday morning?''.
+
+This project is a working demonstration of the modern alternative: a real telephone number
+that a real person can speak to in ordinary sentences, backed by a language model that
+understands the request, and by a calendar that genuinely reserves the slot.
+
+\subsection{Scope, stated honestly and up front}
+
+\begin{honest}{This is a demonstration of a pattern, not a deployed product}
+Read the repository carefully and the boundary is clear, and the project's own README is
+unusually candid about it. What is genuinely proven: the conversation logic, the calendar,
+the conflict detection, the HTTP endpoints, and that the real Gemini model classifies clean
+typed English correctly. What is \emph{not} proven: that any of this survives contact with a
+real human voice on a real phone line. Twilio's speech-to-text output is noisy (mumbling,
+background noise, half-sentences), and the language model in this repository has only ever
+been shown clean, hand-typed sentences. That gap, between ``the API call works'' and ``this
+works on a phone call'', is real and the repository says so itself.
+\end{honest}
+
+\begin{jargon}{Telephony}
+The technology of telephone calls. Here it means the machinery that makes a physical phone
+ring and carries the audio, which this project rents from a company called Twilio rather than
+building itself.
+\end{jargon}
+
+\subsection{Size and shape of the codebase}
+
+Roughly 1,900 lines of Python across nine source modules, five test files, and a
+25-scenario evaluation harness. It is a compact, focused project. Every tracked file was
+read in full to build this document.
+
+\begin{figure}[H]
+\centering
+\begin{forest} dirtree
+[voice-agent
+  [voice\_agent/ \quad {\rmfamily\itshape the application itself}
+    [app.py \quad {\rmfamily\itshape FastAPI web service Twilio talks to}]
+    [conversation.py \quad {\rmfamily\itshape the state machine: all the business logic}]
+    [intent\_engine.py \quad {\rmfamily\itshape the Gemini interface + implementation}]
+    [calendar\_store.py \quad {\rmfamily\itshape SQLite + Google Calendar backends}]
+    [session\_store.py \quad {\rmfamily\itshape per-call memory and transcript}]
+    [twiml.py \quad {\rmfamily\itshape builds Twilio's XML instructions}]
+    [config.py \quad {\rmfamily\itshape environment variables, business rules}]
+    [cli.py \quad {\rmfamily\itshape places a real outbound test call}]
+  ]
+  [eval/ \quad {\rmfamily\itshape the offline evaluation harness}
+    [scenarios.py \quad {\rmfamily\itshape the 25 scripted conversations}]
+    [scripted\_engine.py \quad {\rmfamily\itshape free stand-in for Gemini}]
+    [run\_eval.py \quad {\rmfamily\itshape prints the pass/fail report}]
+  ]
+  [tests/ \quad {\rmfamily\itshape 54 pytest tests}
+    [test\_calendar\_store.py \quad {\rmfamily\itshape 13 tests, no network}]
+    [test\_twiml\_endpoints.py \quad {\rmfamily\itshape 7 tests via a fake HTTP client}]
+    [test\_eval\_scenarios.py \quad {\rmfamily\itshape runs all 25 scenarios}]
+    [test\_llm\_intent.py \quad {\rmfamily\itshape 6 REAL, billed Gemini calls}]
+    [test\_twilio\_integration.py \quad {\rmfamily\itshape signature check + 1 free lookup}]
+  ]
+  [.env.example \quad {\rmfamily\itshape placeholders only; real secrets live outside}]
+  [requirements.txt]
+  [README.md]
+]
+\end{forest}
+\caption{The repository. Note the deliberate separation: \file{voice\_agent/} is production
+code, \file{eval/} contains a test double that must never run in production.}
+\end{figure}
+
+\section{The concepts you need first}
+
+This section defines everything the rest of the document assumes. If a term is already
+familiar, skip it.
+
+\begin{jargon}{API (Application Programming Interface)}
+An agreed way for one program to ask another program to do something. When this project
+``calls the Gemini API'', it sends a message over the internet to Google's servers and gets
+a reply back. Google charges a small amount per call.
+\end{jargon}
+
+\begin{jargon}{Webhook}
+The reverse of the usual arrangement. Normally your program calls someone else's server.
+With a webhook, you give \emph{them} a web address, and \emph{they} call \emph{you} when
+something happens. Twilio does exactly this: when a call comes in, Twilio makes an HTTP
+request to this project's web address and asks ``what should I say?''. This is why the
+project is a web server at all.
+\end{jargon}
+
+\begin{jargon}{HTTP request / POST}
+The message format the web runs on. A ``POST'' request is one that carries a body of data,
+as opposed to just asking for a page. Twilio POSTs the details of the call (who is
+calling, what they said) to this service.
+\end{jargon}
+
+\begin{jargon}{TwiML (Twilio Markup Language)}
+Twilio's instruction format: a small XML document telling Twilio what to do next on the
+call. \code{<Say>} means speak this text aloud. \code{<Gather>} means listen to the caller
+and send me what you heard. \code{<Hangup>} means end the call. This project's entire job,
+from Twilio's point of view, is to answer with TwiML.
+\end{jargon}
+
+\begin{jargon}{XML}
+A text format that stores structured data using angle-bracket tags, like
+\code{<Say>Hello</Say>}. TwiML is one specific flavour of it.
+\end{jargon}
+
+\begin{jargon}{LLM (Large Language Model)}
+A program trained on enormous quantities of text that can read a sentence and produce a
+sensible reply. Gemini 2.5 Flash is Google's fast, cheap model. ``Flash'' signals that it is
+tuned for speed over maximum capability, which matters here because a caller on a phone will
+not tolerate long silences.
+\end{jargon}
+
+\begin{jargon}{Slot filling}
+The task of collecting a fixed set of facts through conversation. The ``slots'' here are
+name, phone, date, time, and duration. The agent's job each turn is to fill whichever slots
+are still empty, one question at a time, until it has enough to book.
+\end{jargon}
+
+\begin{jargon}{State machine}
+A program that is always in exactly one of a limited number of situations (``states''), and
+moves between them according to fixed rules when something happens. A conversation is a
+natural fit: ``no idea what they want yet'' becomes ``booking, still need a name'' becomes
+``booking, waiting for them to confirm''.
+\end{jargon}
+
+\begin{jargon}{SQLite}
+A complete database that lives in a single ordinary file on disk, with no separate server
+process to install or run. Ideal for a small project. Its main limitation, which matters
+later, is that only one thing may write to it at a time.
+\end{jargon}
+
+\begin{jargon}{Interface (in programming)}
+A published list of operations that something promises to provide, without saying how. If
+you write your program against the interface ``a calendar can book, cancel and reschedule'',
+you can later swap the real calendar for a fake one and your program cannot tell. This single
+idea is the backbone of this project's architecture, and Section~\ref{sec:seams} is devoted
+to it.
+\end{jargon}
+
+\begin{jargon}{Test double}
+A stand-in used during testing in place of the real, slow, or expensive thing, the way a
+stunt double stands in for an actor. This project has one: a fake ``language model'' that is
+really just pattern-matching rules.
+\end{jargon}
+
+\begin{jargon}{E.164}
+The international standard for writing phone numbers unambiguously: a plus sign, a country
+code, then the number, with no spaces or dashes. \code{+15551234567}. Remember this one;
+an inconsistency around it is a real bug found in Section~\ref{sec:findings}.
+\end{jargon}
+
+\section{Architecture: the shape of the whole system}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=9mm]
+  \node[extbox] (caller) {Human caller\\{\scriptsize on a real phone}};
+  \node[extbox, right=26mm of caller] (twilio) {\textbf{Twilio}\\{\scriptsize answers the call,}\\{\scriptsize speech $\rightarrow$ text,}\\{\scriptsize text $\rightarrow$ speech}};
+  \node[box, right=26mm of twilio] (app) {\textbf{app.py}\\{\scriptsize FastAPI web service}\\{\scriptsize /voice/incoming}\\{\scriptsize /voice/gather}\\{\scriptsize /voice/status}};
+  \node[box, right=20mm of app] (twiml) {\textbf{twiml.py}\\{\scriptsize builds the}\\{\scriptsize XML reply}};
+  \node[box, below=16mm of app] (conv) {\textbf{conversation.py}\\{\scriptsize ConversationManager}\\{\scriptsize ALL business logic}};
+  \node[store, right=20mm of conv] (sess) {\textbf{session\_store.py}\\{\scriptsize per-call state}\\{\scriptsize + transcript}};
+  \node[box, below left=15mm and 4mm of conv] (intent) {\textbf{intent\_engine.py}\\{\scriptsize IntentEngine}\\{\scriptsize \itshape interface}};
+  \node[box, below right=15mm and 4mm of conv] (cal) {\textbf{calendar\_store.py}\\{\scriptsize CalendarStore}\\{\scriptsize \itshape interface}};
+  \node[extbox, below=12mm of intent] (gemini) {\textbf{Gemini 2.5 Flash}\\{\scriptsize via Vertex AI}\\{\scriptsize (billed per call)}};
+  \node[store, below=12mm of cal] (sqlite) {\textbf{SQLite}\\{\scriptsize appointments}};
+
+  % forward path, labels below the line
+  \draw[flow] (caller) -- node[lbl,below]{voice} (twilio);
+  \draw[flow] (twilio) -- node[lbl,below]{HTTP POST\\{\scriptsize (a webhook)}} (app);
+  \draw[flow] (app) -- node[lbl,right]{one caller\\utterance} (conv);
+  \draw[flow] (conv) -- (intent);
+  \draw[flow] (conv) -- (cal);
+  \draw[flow] (intent) -- node[lbl,right]{JSON} (gemini);
+  \draw[flow] (cal) -- (sqlite);
+  \draw[flow] (conv) -- node[lbl,above]{save} (sess);
+  % return path, arcs above the row so nothing overlaps
+  \draw[dflow] (app) to[bend right=24] node[lbl,above]{TwiML response} (twilio);
+  \draw[dflow] (twilio) to[bend right=24] node[lbl,above]{spoken reply} (caller);
+  % app <-> twiml, a single two-way exchange
+  \draw[{Stealth[length=2.4mm]}-{Stealth[length=2.4mm]}, draw=accent, thick, dashed]
+    (app) -- node[lbl,above]{reply text\\{\scriptsize $\rightarrow$ TwiML XML}} (twiml);
+\end{tikzpicture}}
+\caption{The whole system. Solid arrows are requests going in; dashed arrows are responses
+coming back. The two boxes marked \emph{interface} are the load-bearing design decision:
+everything below them can be swapped out.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{The single most important structural fact}
+
+\code{conversation.py} contains all the business logic, and it does not know that Twilio or
+Gemini exist. It talks only to the two interfaces. Read its import list and this is provable:
+it imports \code{IntentEngine} and \code{CalendarStore}, never \code{GeminiIntentEngine} or
+any Twilio module.
+
+That is what makes the rest of the project possible, and it is the thing to be able to explain
+under questioning. It is unpacked properly in Section~\ref{sec:seams}.
+
+\section{The call flow: what actually happens, in order}
+
+The counter-intuitive part of telephony webhooks is that a single phone call is not one
+continuous conversation from the server's point of view. It is a series of \emph{separate,
+unrelated HTTP requests}. The server has no memory between them. This drives the whole design
+of \code{session\_store.py}.
+
+\begin{keyidea}{Why the server needs a memory at all}
+Each time the caller speaks, Twilio makes a brand new HTTP request. As far as the web service
+is concerned, that request could be from anyone, about anything. Everything the agent knows
+about this call, the name collected two turns ago, the date, whether they confirmed, must
+therefore be written to a database and read back on every single turn. The key used to look it
+back up is Twilio's \code{CallSid}, a unique identifier Twilio assigns to each call and
+includes in every request.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.97\textwidth}{!}{
+\begin{tikzpicture}[node distance=6mm]
+  % lifelines
+  \node (c) at (0,0) {\textbf{Caller}};
+  \node (t) at (4,0) {\textbf{Twilio}};
+  \node (a) at (8.6,0) {\textbf{app.py}};
+  \node (m) at (12.6,0) {\textbf{Manager}};
+  \node (g) at (16.2,0) {\textbf{Gemini}};
+  \node (d) at (19.6,0) {\textbf{SQLite}};
+  \foreach \n in {c,t,a,m,g,d} { \draw[linegrey, thick] (\n) -- ++(0,-13.4); }
+
+  \draw[flow] (0,-1) -- node[lbl,above]{dials the number} (4,-1);
+  \draw[flow] (4,-1.7) -- node[lbl,above]{POST /voice/incoming\\{\scriptsize CallSid, From}} (8.6,-1.7);
+  \draw[flow] (8.6,-2.5) -- node[lbl,above]{create session} (19.6,-2.5);
+  \draw[dflow] (8.6,-3.2) -- node[lbl,above]{TwiML: \code{<Gather><Say>greeting}} (4,-3.2);
+  \draw[dflow] (4,-3.9) -- node[lbl,above]{speaks the greeting, listens} (0,-3.9);
+
+  \node[draw=accent, fill=white, rounded corners=2pt, inner sep=4pt, font=\small\itshape,
+        text=inkblue, align=center] at (10,-4.7) {one turn, repeated until the call ends};
+
+  \draw[flow] (0,-5.5) -- node[lbl,above]{``book me Tuesday at 2''} (4,-5.5);
+  \draw[flow] (4,-6.2) -- node[lbl,above]{POST /voice/gather\\{\scriptsize SpeechResult=text}} (8.6,-6.2);
+  \draw[flow] (8.6,-6.9) -- node[lbl,above]{handle\_turn(text)} (12.6,-6.9);
+  \draw[flow] (12.6,-7.6) -- node[lbl,above]{load transcript} (19.6,-7.6);
+  \draw[flow] (12.6,-8.3) -- node[lbl,above]{parse\_turn(context)} (16.2,-8.3);
+  \draw[dflow] (16.2,-9.0) -- node[lbl,above]{JSON: intent + slots + reply} (12.6,-9.0);
+  \draw[flow] (12.6,-9.7) -- node[lbl,above]{book() if all slots filled \& confirmed} (19.6,-9.7);
+  \draw[dflow] (12.6,-10.4) -- node[lbl,above]{TurnOutcome(reply, end\_call)} (8.6,-10.4);
+  \draw[dflow] (8.6,-11.1) -- node[lbl,above]{TwiML: \code{<Gather>} or \code{<Hangup>}} (4,-11.1);
+  \draw[dflow] (4,-11.8) -- node[lbl,above]{speaks the reply} (0,-11.8);
+
+  \draw[flow] (4,-12.9) -- node[lbl,above]{POST /voice/status (call ended)} (8.6,-12.9);
+\end{tikzpicture}}
+\caption{One call, turn by turn. Every horizontal arrow from Twilio to \file{app.py} is a
+\emph{separate HTTP request} with no memory of the last one, which is why the transcript is
+re-loaded from SQLite on every turn.}
+\label{fig:seq}
+\end{figure}
+
+\subsection{The silence problem, and the fix}
+
+This is one of the genuinely non-obvious engineering details in the project, and it is worth
+understanding because it is the kind of thing that only surfaces when you read the vendor
+documentation properly.
+
+\begin{keyidea}{\code{<Gather>} does not call you back when the caller says nothing}
+By default, Twilio's \code{<Gather>} requests its \code{action} URL only when it actually
+captures speech. If the caller is silent, Twilio simply gives up and moves on to the
+\emph{next} instruction in the TwiML document instead. The consequence is severe: all the
+careful ``sorry, could you repeat that?'' retry logic in \code{conversation.py} would be
+unreachable for a silent caller, which is precisely the caller who most needs it.
+
+The fix is one attribute, \code{action\_on\_empty\_result=True}, set on every \code{<Gather>}
+in \file{voice\_agent/twiml.py}. With it, silence also posts back to \code{/voice/gather},
+just with an empty \code{SpeechResult}, so every possible outcome flows through the one state
+machine.
+\end{keyidea}
+
+\file{twiml.py} is only 40 lines and builds exactly two documents:
+
+\begin{lstlisting}[language=Python,caption={voice\_agent/twiml.py, the essential part}]
+def build_gather_twiml(say_text: str, gather_action_url: str) -> str:
+    response = VoiceResponse()
+    gather = Gather(
+        input="speech",
+        action=gather_action_url,
+        method="POST",
+        speech_timeout="auto",
+        timeout=GATHER_TIMEOUT_SECONDS,      # 6 seconds
+        action_on_empty_result=True,          # <- the fix described above
+    )
+    gather.say(say_text)
+    response.append(gather)
+    # Belt and braces: only reached if Twilio somehow does not re-request
+    # the action URL (e.g. the call already ended).
+    response.say("We didn't receive any input. Goodbye.")
+    response.hangup()
+    return str(response)
+\end{lstlisting}
+
+The trailing \code{<Say>}/\code{<Hangup>} pair is a deliberate safety net. If Twilio ever
+does fall through, the call ends politely rather than hanging in silence.
+
+\section{The seams: why two interfaces change everything}
+\label{sec:seams}
+
+\subsection{The problem being solved}
+
+The evaluation harness runs 25 scenarios. Several are five turns or more. Run those against
+the real Gemini model and each run is over 100 billed API calls, takes real time, and, because
+language models are not perfectly deterministic, might give a different answer tomorrow. Doing
+that on every code change is unaffordable and unreliable.
+
+\begin{jargon}{Deterministic}
+Always producing exactly the same output for the same input. Ordinary code is deterministic;
+a language model largely is not, which is why a test that depends on one is fragile.
+\end{jargon}
+
+\subsection{The solution}
+
+Define what the conversation manager \emph{needs} rather than what it will \emph{use}:
+
+\begin{lstlisting}[language=Python,caption={The two interfaces, reduced to their essence}]
+class IntentEngine(abc.ABC):
+    @abc.abstractmethod
+    def parse_turn(self, ctx: TurnContext) -> TurnResult: ...
+
+class CalendarStore(abc.ABC):
+    @abc.abstractmethod
+    def find_conflict(self, start, duration_minutes, exclude_id=None): ...
+    @abc.abstractmethod
+    def book(self, name, phone, start, duration_minutes) -> Appointment: ...
+    @abc.abstractmethod
+    def get(self, appointment_id) -> Appointment: ...
+    @abc.abstractmethod
+    def list_by_phone(self, phone, active_only=True) -> list[Appointment]: ...
+    @abc.abstractmethod
+    def reschedule(self, appointment_id, new_start, new_duration_minutes=None): ...
+    @abc.abstractmethod
+    def cancel(self, appointment_id) -> Appointment: ...
+\end{lstlisting}
+
+\begin{jargon}{Abstract base class / \code{abc.ABC}}
+Python's way of writing an interface. Marking a method \code{@abstractmethod} means ``every
+real implementation must provide this''; Python refuses to create an object from a class that
+has not filled them all in. It turns a design intention into an error the language enforces.
+\end{jargon}
+
+Now the identical \code{ConversationManager} runs in three different worlds:
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+  \node[box, minimum width=42mm] (cm) {\textbf{ConversationManager}\\{\scriptsize the identical code in all three columns}};
+
+  \node[box, below left=14mm and 30mm of cm] (p) {\textbf{1. Production}\\{\scriptsize uvicorn / real calls}};
+  \node[box, below=14mm of cm] (t) {\textbf{2. pytest}\\{\scriptsize TestClient, 47 free tests}};
+  \node[box, below right=14mm and 30mm of cm] (e) {\textbf{3. eval harness}\\{\scriptsize 25 scenarios}};
+
+  \node[extbox, below=9mm of p, align=center] (p2) {GeminiIntentEngine\\{\scriptsize\itshape real, billed}\\[2pt] SqliteCalendarStore\\{\scriptsize\itshape real file on disk}};
+  \node[extbox, below=9mm of t, align=center] (t2) {ScriptedIntentEngine\\{\scriptsize\itshape free regex double}\\[2pt] SqliteCalendarStore\\{\scriptsize\itshape temp file}};
+  \node[extbox, below=9mm of e, align=center] (e2) {ScriptedIntentEngine\\{\scriptsize\itshape free regex double}\\[2pt] SqliteCalendarStore\\{\scriptsize\itshape temp file}};
+
+  \draw[flow] (cm) -- (p); \draw[flow] (cm) -- (t); \draw[flow] (cm) -- (e);
+  \draw[flow] (p) -- (p2); \draw[flow] (t) -- (t2); \draw[flow] (e) -- (e2);
+
+  \node[lbl, below=5mm of p2, text width=34mm] {costs real money,\\proves the real thing};
+  \node[lbl, below=5mm of t2, text width=34mm] {free, instant,\\fully deterministic};
+  \node[lbl, below=5mm of e2, text width=34mm] {free, instant,\\fully deterministic};
+\end{tikzpicture}}
+\caption{One state machine, three wirings. This is dependency injection: the manager is
+\emph{handed} its collaborators rather than creating them, so the caller decides whether they
+are real or fake.}
+\end{figure}
+
+\begin{jargon}{Dependency injection}
+A long name for a simple habit. Instead of a class building the things it needs
+(\code{self.engine = GeminiIntentEngine()}, which welds it to Gemini forever), it accepts them
+as arguments (\code{def \_\_init\_\_(self, intent\_engine, ...)}). Whoever creates the object
+chooses what to pass. That choice point is the ``seam'' that testing needs.
+\end{jargon}
+
+\begin{honest}{The test double is honest about being one, and that matters}
+It would be easy, and dishonest, to present \code{ScriptedIntentEngine} as a ``fallback'' so
+the project could claim it works without an API key. The repository refuses to do this. Its
+docstring states plainly: \emph{``This is a TEST DOUBLE, not a production fallback.''} It
+lives in \file{eval/}, not in \file{voice\_agent/}, so it is physically outside the production
+package. \code{app.py} always wires up the real Gemini engine unless a test explicitly passes
+something else. The ``LLM-driven'' claim therefore survives scrutiny: the shipped path really
+does use the model.
+\end{honest}
+
+\section{Module by module}
+
+\subsection{\file{voice\_agent/config.py}}
+
+The smallest module, and quietly disciplined. Every value is read from the environment
+\emph{at call time}, never cached at import time, and never logged.
+
+\begin{lstlisting}[language=Python,caption={The required-variable helper and the business rules}]
+def _require(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ConfigError(f"Required environment variable {name} is not set")
+    return value
+
+BUSINESS_HOURS_START = 9   # 9:00 local
+BUSINESS_HOURS_END = 17    # 17:00 local
+DEFAULT_APPOINTMENT_DURATION_MINUTES = 30
+MAX_RETRY_COUNT = 3        # consecutive unclear turns before handoff
+MAX_TURN_COUNT = 14        # total turns before forced handoff
+\end{lstlisting}
+
+Two small decisions worth noticing. Reading at call time rather than import time is what lets
+a test set an environment variable and have it actually take effect. And failing loudly with
+\code{ConfigError} when a credential is missing is better than starting up and failing
+mysteriously on the first real call.
+
+\begin{jargon}{Environment variable}
+A named value supplied to a program by the system that starts it, rather than written in the
+code. It is the standard way to supply passwords and API keys, precisely so they never appear
+in the source code and never get committed to version control.
+\end{jargon}
+
+\subsection{\file{voice\_agent/session\_store.py}}
+
+Two SQLite tables, and the answer to ``how does a stateless web service remember a phone
+call?''.
+
+\begin{itemize}
+  \item \code{sessions}: one row per call, keyed by \code{call\_sid}. The entire
+  \code{SessionState} object is serialised to JSON and stuffed into one \code{state\_json}
+  column.
+  \item \code{transcript}: one row per utterance, for auditing what was actually said.
+\end{itemize}
+
+\begin{jargon}{JSON, and serialisation}
+JSON is a plain-text format for structured data. \emph{Serialising} means flattening a
+live object into text so it can be stored; \emph{deserialising} is rebuilding the object from
+that text. Here, the whole session state becomes one string in one column.
+\end{jargon}
+
+\begin{keyidea}{Why store the state as one JSON blob instead of proper columns?}
+It is a real trade-off, chosen deliberately. Storing JSON means adding a new field to
+\code{SessionState} requires no database migration; the code just works. The price is that
+you cannot query on those fields (``show me all calls stuck on the phone slot'' is not
+expressible in SQL here), and nothing validates the shape. For a single-purpose store that is
+only ever read back whole, by primary key, this is a sound trade. It would not be for a table
+you needed to report on.
+\end{keyidea}
+
+The \code{save} method uses an \emph{upsert}, which inserts a row or updates it if the key
+already exists, in one atomic statement:
+
+\begin{lstlisting}[language=SQL,caption={The upsert in session\_store.save}]
+INSERT INTO sessions (call_sid, state_json, created_at, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(call_sid) DO UPDATE
+  SET state_json = excluded.state_json, updated_at = excluded.updated_at
+\end{lstlisting}
+
+\begin{jargon}{Parameterised query (the \code{?} marks)}
+The \code{?} placeholders are not string formatting. The database receives the query and the
+values separately, so a value can never be mistaken for SQL code. This is the correct defence
+against \emph{SQL injection}, where hostile input like \code{'; DROP TABLE appointments; --}
+would otherwise be executed as a command. Every query in this project is parameterised, which
+is exactly right, and worth pointing out because a caller's spoken name goes into the database.
+\end{jargon}
+
+\code{mark\_abandoned\_if\_unresolved} is the neat part. When Twilio reports the call ended,
+this checks whether any outcome was ever reached; if not, the call is recorded as
+\code{abandoned}. Crucially it refuses to overwrite an outcome that already exists, so hanging
+up after a successful booking still counts as booked. There is a test for exactly this.
+
+\subsection{\file{voice\_agent/calendar\_store.py}}
+
+The largest module (339 lines) and the one that does the real work. It defines the
+\code{CalendarStore} interface, two implementations, and the conflict rule.
+
+\subsubsection{The conflict rule}
+
+Everything hinges on eight characters:
+
+\begin{lstlisting}[language=Python,caption={The half-open interval overlap test}]
+def _overlaps(a_start, a_end, b_start, b_end) -> bool:
+    """Half-open interval overlap: touching endpoints (a_end == b_start) is NOT a conflict."""
+    return a_start < b_end and b_start < a_end
+\end{lstlisting}
+
+\begin{keyidea}{Why \code{<} and not \code{<=}}
+Two appointments where one ends at exactly 9:30 and the next starts at exactly 9:30 do not
+overlap; they are back to back, which is what a busy clinic wants. Using \code{<=} would
+report a false conflict and refuse a perfectly good booking. This is the classic
+\emph{half-open interval}: the start instant belongs to the appointment, the end instant does
+not.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{
+\begin{tikzpicture}[xscale=1.5]
+  \draw[->, thick, inkblue] (0,0) -- (9.3,0) node[right, font=\small] {time};
+  \foreach \x/\lab in {0.5/9:00, 2.5/9:30, 4.5/10:00, 6.5/10:30, 8.5/11:00}
+    { \draw[linegrey] (\x,-0.15) -- (\x,4.6); \node[font=\scriptsize, below] at (\x,-0.15) {\lab}; }
+
+  % existing
+  \fill[accent!30, draw=accent, thick] (0.5,3.7) rectangle (2.5,4.3);
+  \node[font=\scriptsize, inkblue] at (1.5,4.0) {EXISTING 9:00-9:30};
+
+  % case 1 adjacent
+  \fill[okgreen!25, draw=okgreen, thick] (2.5,2.8) rectangle (4.5,3.4);
+  \node[font=\scriptsize] at (3.5,3.1) {9:30-10:00};
+  \node[font=\scriptsize\bfseries, okgreen, right] at (4.7,3.1) {NO conflict: touches only at the boundary};
+
+  % case 2 partial
+  \fill[warnred!25, draw=warnred, thick] (1.5,1.9) rectangle (3.5,2.5);
+  \node[font=\scriptsize] at (2.5,2.2) {9:15-9:45};
+  \node[font=\scriptsize\bfseries, warnred, right] at (4.7,2.2) {CONFLICT: partial overlap};
+
+  % case 3 exact
+  \fill[warnred!25, draw=warnred, thick] (0.5,1.0) rectangle (2.5,1.6);
+  \node[font=\scriptsize] at (1.5,1.3) {9:00-9:30};
+  \node[font=\scriptsize\bfseries, warnred, right] at (4.7,1.3) {CONFLICT: exact same slot};
+
+  % case 4 later
+  \fill[okgreen!25, draw=okgreen, thick] (4.5,0.1) rectangle (6.5,0.7);
+  \node[font=\scriptsize] at (5.5,0.4) {10:00-10:30};
+  \node[font=\scriptsize\bfseries, okgreen, right] at (6.7,0.4) {NO conflict};
+\end{tikzpicture}}
+\caption{\code{a\_start < b\_end and b\_start < a\_end}, drawn. The green 9:30 case is the one
+a naive \code{<=} implementation gets wrong, and it is covered by scenario
+\code{boundary\_adjacent\_appointments\_no\_conflict}.}
+\end{figure}
+
+\subsubsection{\code{SqliteCalendarStore}, the default}
+
+One table, \code{appointments}, with \code{status} either \code{booked} or \code{cancelled}.
+Cancelling is a \emph{soft delete}: the row stays, the status changes, so the history survives
+and the conflict check simply ignores cancelled rows.
+
+\begin{jargon}{Soft delete}
+Marking a record as inactive rather than physically removing it. You keep an audit trail and
+can undo; the cost is that every query must remember to filter out the dead rows.
+\end{jargon}
+
+\begin{honest}{\code{find\_conflict} reads the entire table into Python on every booking}
+The query is \code{SELECT * FROM appointments WHERE status = 'booked'} with \emph{no time
+range filter at all}. Every booked appointment ever made, past and future, is loaded and
+looped over in Python to find an overlap. There is also no index on \code{start\_time} or
+\code{phone}.
+
+At this project's scale (one phone line, a handful of appointments) this is completely
+invisible, and choosing simplicity over premature optimisation is defensible. But it is
+\emph{O(n)} work per booking that a database is built to do in \emph{O(log n)}, and the fix is
+a one-line \code{WHERE start\_time < ? AND ...} clause plus an index. Worth being able to say
+``I know, here is exactly why it does not matter yet, and here is the fix'' rather than being
+shown it.
+\end{honest}
+
+\begin{jargon}{O(n) and O(log n)}
+Shorthand for how work grows with data size. \emph{O(n)}: ten times the appointments means ten
+times the work. \emph{O(log n)}: ten times the appointments means only slightly more work,
+because an index lets the database skip most rows. This is what indexes are for.
+\end{jargon}
+
+\subsubsection{\code{GoogleCalendarStore}, the optional adapter}
+
+\begin{sloppypar}
+A complete second implementation against the real Google Calendar API v3, using
+\code{events.insert}, \code{events.patch}, \code{events.delete} and \code{freebusy.query} for
+conflict detection. \code{get\_calendar\_store()} selects it automatically when the environment
+variable \code{GOOGLE\_CALENDAR\_CREDENTIALS\_PATH} is set and the file it names exists;
+otherwise the SQLite store is used.
+\end{sloppypar}
+
+\begin{jargon}{Adapter (design pattern)}
+Code whose only job is to make one thing present itself with the shape of another. Here it
+makes Google Calendar look like a \code{CalendarStore}, translating between appointment ids and
+Google event ids so nothing upstream has to know the difference.
+\end{jargon}
+
+The Google client libraries are imported \emph{inside} \code{\_\_init\_\_}, not at the top of
+the file. That is deliberate: the default SQLite install then does not need them present.
+
+\begin{honest}{The Google adapter has never been run, and it has at least one real defect}
+The README is upfront that no Google Calendar credentials were ever provided, so this class
+has never executed against a live calendar. It is not a stub, but it is unverified. Reading it
+closely, two concrete problems are visible without running it:
+
+\textbf{One.} \code{cancel()} calls \code{events().delete()}, which destroys the event
+outright, then \emph{fabricates} a return value with \code{start\_time=datetime.now()}. But
+\code{conversation.py} uses that return value to speak to the caller:
+\code{f"Done, your appointment for \{when\} is cancelled"}. On the Google backend the agent
+would therefore read back \emph{the current time} rather than the appointment's real time. On
+SQLite this is invisible, because there \code{cancel()} returns the true row.
+
+\textbf{Two.} The \code{Appointment} dataclass declares \code{id: int}, but Google event ids
+are strings, and this class assigns them straight into that field. Python does not enforce
+type hints at runtime so nothing crashes, but the declared contract is being broken, and
+\code{SessionState.target\_appointment\_id} is likewise typed \code{Optional[int]}.
+
+Neither is hard to fix. Both are the predictable cost of writing an implementation you cannot
+run, which is itself the honest lesson here.
+\end{honest}
+
+\subsection{\file{voice\_agent/intent\_engine.py}}
+
+This is where the language model lives. \code{TurnContext} in, \code{TurnResult} out.
+
+\begin{lstlisting}[language=Python,caption={The data crossing the boundary}]
+@dataclass
+class TurnContext:
+    caller_number: str
+    utterance: str                      # "" if <Gather> captured no speech
+    history: list[dict]                 # [{"speaker": "agent"/"caller", "text": ...}]
+    known_slots: dict                   # what we have collected so far
+    current_action: Optional[str]       # book/reschedule/cancel, if established
+    today: date                         # injected, never datetime.now()
+
+@dataclass
+class TurnResult:
+    reply: str                          # what to say back
+    intent: str                         # book|reschedule|cancel|unclear|goodbye
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    date_iso: Optional[str] = None      # "YYYY-MM-DD"
+    time_24h: Optional[str] = None      # "HH:MM"
+    duration_minutes: Optional[int] = None
+    confirmed: Optional[bool] = None
+\end{lstlisting}
+
+\begin{keyidea}{\code{confirmed} is three-valued, and that is deliberate}
+\code{Optional[bool]} means it can be \code{True}, \code{False}, or \code{None}, and all three
+are distinct: ``yes, book it'', ``no, that's wrong'', and ``I have not been asked yet''. A plain
+\code{True/False} would silently merge ``said no'' with ``never asked'', and the agent would
+either book without consent or never book at all. The same three-valued logic is why the code
+tests \code{if slots.get("confirmed") is not True} rather than \code{if not confirmed}.
+\end{keyidea}
+
+\subsubsection{Making the model fast enough for a phone call}
+
+Three settings do the work, and the reasoning behind them is the most interesting engineering
+judgement in the project:
+
+\begin{lstlisting}[language=Python,caption={GeminiIntentEngine.parse\_turn, the configuration}]
+config=types.GenerateContentConfig(
+    system_instruction=system_prompt,
+    thinking_config=types.ThinkingConfig(thinking_budget=0),  # turn thinking OFF
+    response_mime_type="application/json",                    # must be JSON
+    response_schema=self._response_schema(),                  # this exact shape
+    temperature=0.1,                                          # near-deterministic
+)
+\end{lstlisting}
+
+\begin{keyidea}{Sometimes engineering means turning the clever feature off}
+Gemini 2.5 Flash ``thinks'' before answering by default, which improves hard reasoning and
+costs seconds and tokens. The README records an actual measurement: an exploratory call spent
+56 thinking tokens on a one-word answer. On a phone call, multiple seconds of dead air is a
+product failure; the caller assumes the line dropped. So thinking is set to zero. The measured
+result with thinking off plus a strict schema was 1.8 seconds and a clean structured reply.
+
+This is a genuinely good instinct to be able to articulate: the right configuration depends
+entirely on the product, and for a live phone turn, latency beats depth.
+\end{keyidea}
+
+\begin{jargon}{Token}
+The unit language models read, write, and bill in: roughly a short word or word-fragment.
+``Thinking tokens'' are ones the model generates privately to reason before answering. You pay
+for them, and you wait for them.
+\end{jargon}
+
+\begin{jargon}{Temperature}
+A dial for randomness. At 0 the model gives its single most likely answer every time; higher
+values invite variety. For creative writing you want it high. For extracting a date from a
+sentence you want it near zero, hence 0.1.
+\end{jargon}
+
+\begin{jargon}{Response schema, and structured output}
+Rather than asking the model in prose to ``please reply in JSON'' and hoping, the schema is
+supplied to the API as a formal specification and the platform constrains the output to match
+it. The difference matters: politely asking sometimes yields ``Sure! Here's the JSON:
+\{...\}'', which then fails to parse. This is the robust way to get machine-readable output.
+\end{jargon}
+
+\subsubsection{Defensive handling of the reply}
+
+The parsing is properly paranoid, which is correct when the input comes from a model:
+
+\begin{lstlisting}[language=Python,caption={Never trust the model's output shape}]
+intent = data.get("intent", "unclear")
+if intent not in VALID_INTENTS:
+    intent = "unclear"           # an unknown intent degrades to "ask again"
+...
+reply=data.get("reply") or "Sorry, could you say that again?",
+name=data.get("name") or None,   # "" and null both collapse to None
+\end{lstlisting}
+
+Any exception at all from the API call becomes an \code{IntentEngineError}, which
+\code{conversation.py} turns into a graceful spoken handoff rather than a crash. An unknown
+intent degrades to \code{unclear}, which routes into the retry path. Both are the right
+failure direction: a caller hears a sentence, never silence.
+
+\subsection{\file{voice\_agent/conversation.py}: the state machine}
+
+The heart of the project. 338 lines, no Twilio, no Gemini, no SQL.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.93\textwidth}{!}{
+\begin{tikzpicture}[node distance=7mm]
+  \node[box] (start) {\code{handle\_turn(session, utterance)}};
+  \node[dec, below=7mm of start, text width=20mm] (cap) {turn\_count\\ $>$ 14?};
+  \node[box, right=22mm of cap, fill=warnred!12, draw=warnred] (h1) {\textbf{HANDOFF}\\{\scriptsize end call}};
+  \node[box, below=7mm of cap] (parse) {build TurnContext,\\call \code{intent\_engine.parse\_turn}};
+  \node[dec, below=7mm of parse, text width=20mm] (err) {engine\\raised?};
+  % TECH FAILURE goes LEFT: the right column at this row is needed for the retry re-ask.
+  \node[box, left=22mm of err, fill=warnred!12, draw=warnred] (h2) {\textbf{TECH FAILURE}\\{\scriptsize end call}};
+  \node[dec, below=8mm of err, text width=20mm] (unc) {intent ==\\unclear?};
+  \node[dec, right=24mm of unc, text width=20mm] (rc) {retry\_count\\ $>$ 3?};
+  \node[box, right=20mm of rc, fill=warnred!12, draw=warnred] (h3) {\textbf{HANDOFF}};
+  \node[box, above=9mm of rc, fill=softgrey] (rep) {``say that again?''\\{\scriptsize call continues}};
+  \node[dec, below=8mm of unc, text width=20mm] (bye) {intent ==\\goodbye?};
+  \node[box, right=22mm of bye, fill=okgreen!12, draw=okgreen] (end) {end call;\\{\scriptsize abandoned if no outcome yet}};
+  \node[box, below=7mm of bye] (merge) {\code{retry\_count = 0};\\merge slots; set/switch action};
+  \node[dec, below=7mm of merge, text width=22mm] (act) {which\\action?};
+  \node[box, below left=9mm and 8mm of act] (bk) {\code{\_handle\_book}};
+  \node[box, below=9mm of act] (cx) {\code{\_handle\_cancel}};
+  \node[box, below right=9mm and 8mm of act] (rs) {\code{\_handle\_reschedule}};
+
+  \draw[flow] (start) -- (cap);
+  \draw[flow] (cap) -- node[lbl,above]{yes} (h1);
+  \draw[flow] (cap) -- node[lbl,left]{no} (parse);
+  \draw[flow] (parse) -- (err);
+  \draw[flow] (err) -- node[lbl,above]{yes} (h2);
+  \draw[flow] (err) -- node[lbl,right]{no} (unc);
+  \draw[flow] (unc) -- node[lbl,above]{yes} (rc);
+  \draw[flow] (rc) -- node[lbl,above]{yes} (h3);
+  \draw[flow] (rc) -- node[lbl,right]{no} (rep);
+  \draw[flow] (unc) -- node[lbl,left]{no} (bye);
+  \draw[flow] (bye) -- node[lbl,above]{yes} (end);
+  \draw[flow] (bye) -- node[lbl,left]{no} (merge);
+  \draw[flow] (merge) -- (act);
+  \draw[flow] (act) -- node[lbl,left]{book} (bk);
+  \draw[flow] (act) -- node[lbl,left]{cancel} (cx);
+  \draw[flow] (act) -- node[lbl,right]{reschedule} (rs);
+\end{tikzpicture}}
+\caption{\code{handle\_turn}, the top-level decision flow. Note the order: the safety caps are
+checked \emph{before} anything expensive happens, so a runaway call cannot keep billing Gemini.}
+\label{fig:sm}
+\end{figure}
+
+\subsubsection{The two safety nets, and why there are two}
+
+\begin{keyidea}{A retry cap and a turn cap catch different failures}
+\code{MAX\_RETRY\_COUNT = 3} counts \emph{consecutive unintelligible} turns. It catches the
+bad line, the caller in a tunnel, the background noise.
+
+\code{MAX\_TURN\_COUNT = 14} counts \emph{all} turns, and catches the case the retry cap
+cannot: a caller whose every turn is perfectly intelligible but never actually completes
+anything. Say ``sometime in the morning'' forever and \code{retry\_count} resets to zero every
+single turn, because each turn was a valid continuation. Without the second cap, the call
+never ends. Scenario 24 tests exactly this, and asserts \code{retry\_count == 0} to prove it
+was the turn cap and not the retry cap that fired.
+
+That is a genuinely thoughtful pair of tests: the assertion proves \emph{which} mechanism
+saved the call, not merely that something did.
+\end{keyidea}
+
+Note also \code{session.retry\_count = 0} is reset on any clear turn, so the cap means ``three
+in a row'', not ``three per call''. That is the humane choice.
+
+\subsubsection{The booking path, traced}
+
+\code{\_handle\_book} runs a strict gauntlet, in this order:
+
+\begin{pseudocode}{\_handle\_book, in order}
+\Step{1. missing = any of (name, phone, date\_iso, time\_24h) still empty?}
+\Indent{if so: return the model's question, keep the call open}
+\Step{2. slots["confirmed"] is not True?}
+\Indent{if so: return the model's read-back, keep the call open}
+\Step{3. parse date+time into a real datetime}
+\Indent{unparseable: clear time, clear confirmed, re-ask}
+\Step{4. \_validate\_business\_slot(dt)}
+\Indent{in the past, or outside 9:00-17:00: clear time, clear confirmed, re-ask}
+\Step{5. calendar\_store.book(...)}
+\Indent{ConflictError: clear time, clear confirmed, offer to pick another time}
+\Step{6. success: outcome = "booked", speak the confirmation}
+\end{pseudocode}
+
+\begin{keyidea}{The clear-time-and-confirmation reset is the subtle bit}
+Every rejection path does the same two things:
+\code{slots["time\_24h"] = None} and \code{slots["confirmed"] = None}. Miss either and the bug
+is nasty. Leave the time set and the next turn re-validates the same bad time forever. Leave
+\code{confirmed} at \code{True} and the caller's ``yes'' to the \emph{rejected} 7am silently
+becomes a ``yes'' to whatever time they mention next, booking without real consent. Resetting
+both forces a fresh, explicit confirmation of the corrected time. This pattern is repeated
+identically in \code{\_handle\_reschedule}.
+\end{keyidea}
+
+\subsubsection{Validation, and the injectable clock}
+
+\begin{lstlisting}[language=Python,caption={Why now\_fn exists}]
+def __init__(self, intent_engine, calendar_store, session_store,
+             now_fn: Callable[[], datetime] = datetime.now):   # <- injected clock
+    ...
+
+def _validate_business_slot(self, dt):
+    now = self.now_fn()                       # not datetime.now()
+    if dt <= now:
+        return "That date and time has already passed. ..."
+    if not (config.BUSINESS_HOURS_START <= dt.hour < config.BUSINESS_HOURS_END):
+        return "That's outside our business hours ..."
+    return None
+\end{lstlisting}
+
+\begin{keyidea}{Injecting the clock is what makes the tests possible at all}
+A test asserting ``the appointment lands on 2026-07-15 at 14:00'' after the caller says
+``July 15th at 2pm'' is only correct on days when that date is still in the future. Call
+\code{datetime.now()} directly and the test suite quietly rots: it passes today and starts
+failing on 16 July 2026 for reasons unrelated to any code change. Threading a \code{now\_fn}
+through and pinning every scenario to \code{FIXED\_NOW = datetime(2026, 7, 6, 13, 0)} makes
+time itself an input. Notice \code{FIXED\_NOW} is at 13:00: mid-afternoon, deliberately, so a
+same-day ``past'' time (10am) can be tested without also tripping the business-hours check,
+keeping the two rules independently testable. That is careful test design.
+\end{keyidea}
+
+Note the business-hours check tests \code{dt.hour} only, so 16:45 passes even though a 30
+minute appointment then runs 15 minutes past closing. \code{config.py} concedes this in a
+comment (``last bookable start is 16:xx for a 30 min slot''). It is a known simplification, not
+an oversight.
+
+\subsubsection{Changing your mind mid-call}
+
+\begin{lstlisting}[language=Python,caption={The action switch}]
+if session.action is None:
+    session.action = result.intent
+elif session.action != result.intent:
+    # Caller changed their mind mid-call: start this new action clean.
+    session.action = result.intent
+    session.slots = {}
+    session.target_appointment_id = None
+\end{lstlisting}
+
+Wiping the slots on a switch is right: a date gathered for a booking should not leak into a
+cancellation. The cost is that a caller who switches and switches back re-answers everything.
+For a phone agent, correctness beats convenience here.
+
+\subsection{\file{voice\_agent/app.py}: the web layer}
+
+Deliberately thin. Its whole job is: receive an HTTP form, call the manager, turn the answer
+into TwiML.
+
+\begin{jargon}{FastAPI}
+A Python web framework: a library that handles the plumbing of receiving HTTP requests and
+routing them to your functions, so you write only the logic. The \code{@app.post("/voice/gather")}
+line above a function means ``run this when a POST arrives at that address''.
+\end{jargon}
+
+\subsubsection{The app factory, and a clever import trick}
+
+\code{create\_app(...)} takes optional stores and an engine. Pass nothing and it wires up the
+real production dependencies; pass fakes and you get a test instance. But that creates a
+problem: \code{uvicorn} needs a module-level \code{app} object, and building one would demand
+real credentials, which would make merely \emph{importing} the module fail in tests.
+
+\begin{lstlisting}[language=Python,caption={PEP 562 module-level \_\_getattr\_\_}]
+def __getattr__(name: str):
+    if name == "app":
+        return create_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+\end{lstlisting}
+
+\begin{keyidea}{Lazy construction via module \code{\_\_getattr\_\_}}
+This hook runs only when someone actually asks for an attribute the module does not otherwise
+have. So \code{import voice\_agent.app} costs nothing and needs no credentials, while
+\code{uvicorn voice\_agent.app:app} touches \code{app}, triggers the hook, and builds the real
+thing. It neatly resolves the tension between ``uvicorn wants a module-level object'' and
+``tests must import this without credentials''. It is niche but legitimate Python (PEP 562),
+and it is well commented in the source.
+\end{keyidea}
+
+\subsubsection{Signature verification}
+
+\begin{jargon}{Webhook signature}
+Your webhook address is a public URL: anyone who finds it can POST to it and pretend to be
+Twilio. To prevent this, Twilio signs each request with a cryptographic hash computed from the
+URL, the form data, and your secret auth token, in the \code{X-Twilio-Signature} header. You
+recompute it with the same token; if they match, the request really came from Twilio, because
+only Twilio and you know the token.
+\end{jargon}
+
+\begin{honest}{The signature check silently does nothing in the default configuration}
+This is the most significant finding in the review, and it was confirmed by running the code,
+not by reading it.
+
+\begin{lstlisting}[language=Python]
+if app.state.enforce_signature:
+    base_url = config.public_webhook_base_url()
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    if base_url and auth_token:              # <- if either is missing, NO CHECK RUNS
+        if not verify_twilio_signature(request, form, auth_token, base_url):
+            return Response(status_code=403, content="Invalid Twilio signature")
+\end{lstlisting}
+
+\code{PUBLIC\_WEBHOOK\_BASE\_URL} is blank by default, and \file{.env.example} explicitly
+instructs ``Leave blank for local development and testing''. So with \code{enforce\_signature=True},
+the nominally secure setting, an entirely unsigned request is accepted. Driving the real app
+with a \code{TestClient} confirms it: base URL unset plus no signature header at all returns
+\textbf{HTTP 200}. Set the base URL and the same unsigned request correctly returns
+\textbf{HTTP 403}, so the check itself is implemented correctly.
+
+There is a real reason for the design: Twilio signs the \emph{public} URL it requested, so
+without knowing that URL you cannot recompute the signature, and there is genuinely nothing to
+check against locally. The danger is the failure \emph{direction}. This \emph{fails open}: the
+consequence of a missing setting is silently no security, not a refusal to start. Deploy this
+behind a real URL and forget the variable, and the booking endpoints are wide open to anyone
+who finds them, with no warning in the logs.
+
+The fix is small and worth stating in an interview: if \code{enforce\_signature} is true and
+the base URL is missing, refuse to start, or at minimum log a loud warning on every request.
+Make the safe path the default and the insecure path something you must deliberately choose,
+for example an explicit \code{allow\_unsigned=True}.
+\end{honest}
+
+\subsubsection{Endpoint behaviour}
+
+\code{/voice/status} accepts Twilio's terminal statuses (\code{completed}, \code{failed},
+\code{busy}, \code{no-answer}, \code{canceled}) and marks the call abandoned if no outcome was
+reached. It returns \code{204 No Content}, which is correct: Twilio wants nothing back.
+
+\subsection{\file{voice\_agent/cli.py}: the outbound test call}
+
+The only code in the repository that spends real money on telephony, and it is fenced off
+accordingly. In order: validate the number against an E.164 regex; refuse outright without a
+public URL; load and validate the Twilio credentials; then an interactive
+\code{[y/N]} confirmation naming both numbers and warning of charges, skippable only with an
+explicit \code{--yes}.
+
+\begin{honest}{The guardrails are real, and this document respected them}
+Nothing else in the repository imports or invokes \code{cli.py}; it runs only when a human
+types the command. In line with the project's budget rule and the instructions for this
+review, \textbf{no phone call was placed and no billed API test was run} while producing this
+document. The 7 tests marked \code{real\_api} were deliberately deselected, never executed.
+Every claim below about them rests on reading the code and the README, and is labelled as such.
+\end{honest}
+
+\section{The evaluation harness}
+
+\subsection{What it actually is}
+
+\code{eval/scenarios.py} defines 25 \code{Scenario} objects. Each is one or more simulated
+calls (a phone number plus a list of caller utterances) and a \code{check} function asserting
+on the resulting calendar and session state.
+
+\begin{keyidea}{What the 25 scenarios do and do not exercise}
+This is the claim to pin down precisely, because the honest answer is narrower than
+``25 scenarios pass'' sounds, and the repository states it correctly.
+
+\textbf{Real, and genuinely exercised:} the \code{ConversationManager} state machine, the real
+\code{SqliteCalendarStore} on a real temporary database file, the real \code{SessionStore},
+real conflict detection, real business-hours and past-date validation, real retry and turn
+caps.
+
+\textbf{Replaced by a test double:} the language model, swapped for the regex-based
+\code{ScriptedIntentEngine}.
+
+\textbf{Not involved at all:} Twilio, FastAPI, HTTP, TwiML. Utterances are fed straight into
+\code{manager.handle\_turn}, deliberately ``bypassing Twilio and FastAPI entirely'' as the
+module docstring says.
+
+So ``25/25'' is a strong statement about the booking \emph{logic}, and no statement whatever
+about speech recognition or the phone line. The FastAPI and TwiML layers are covered
+separately, by the 7 endpoint tests. The README does not overstate this.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.9\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+  \node[box] (s) {\code{run\_scenario(scenario)}};
+  \node[box, below=6mm of s] (tmp) {\code{tempfile.mkdtemp()}\\{\scriptsize a fresh throwaway directory}};
+  \node[box, below=6mm of tmp] (wire) {build real SqliteCalendarStore + real SessionStore\\+ ScriptedIntentEngine + \code{now\_fn = lambda: FIXED\_NOW}};
+  \node[box, below=6mm of wire] (loop) {for each call, for each utterance:\\\code{manager.handle\_turn(session, text)}\\{\scriptsize break early if outcome.end\_call}};
+  \node[box, below=6mm of loop] (chk) {\code{scenario.check(result)}\\{\scriptsize assert on calendar + session state}};
+  \node[box, below=6mm of chk, fill=warnred!8, draw=warnred] (fin) {\code{finally: shutil.rmtree(tmp\_dir)}\\{\scriptsize total isolation, always cleaned up}};
+  \draw[flow] (s)--(tmp); \draw[flow] (tmp)--(wire); \draw[flow] (wire)--(loop);
+  \draw[flow] (loop)--(chk); \draw[flow] (chk)--(fin);
+\end{tikzpicture}}
+\caption{Every scenario gets a brand new temporary database and is destroyed afterwards in a
+\code{finally} block, so no scenario can ever influence another.}
+\end{figure}
+
+A nice defensive touch: \code{scenario.check} is itself wrapped in a \code{try/except}, so a
+bug in a check function fails that one scenario rather than crashing the whole run.
+
+\subsection{The 25 scenarios, verified}
+
+The harness was run for this document. It required no third-party packages and made no network
+calls, which independently confirms the ``runs free'' claim.
+
+\begin{lstlisting}[caption={Observed output, reproducing the committed docs/screenshots/run-output.txt exactly}]
+$ python -m eval.run_eval
+[PASS] (book) book_simple_one_shot
+[PASS] (book) book_multi_turn_slot_filling
+... 21 lines omitted for space ...
+[PASS] (unclear_speech) max_turn_cap_handoff
+[PASS] (conflict) reschedule_conflict_then_alternate
+
+25/25 scenarios passed
+\end{lstlisting}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}rlp{7.7cm}@{}}
+\toprule
+\textbf{\#} & \textbf{Category} & \textbf{What it actually pins down} \\
+\midrule
+1 & book & Everything in one sentence, then ``yes''. The happy path. \\
+2 & book & One fact per turn; a spoken phone number wins over caller ID. \\
+3 & book & ``one hour'' overrides the 30 minute default. \\
+4 & book & Spoken number stored; caller ID \emph{not} used. See finding below. \\
+5 & book & Caller rejects the read-back, corrects, confirms: exactly 1 appointment, not 2. \\
+6 & reschedule & Books in call 1, moves it in call 2. State survives across calls. \\
+7 & reschedule & Nothing on file: graceful, then goodbye becomes \code{abandoned}. \\
+8 & cancel & Cancel marks status \code{cancelled}, active list empties, row survives. \\
+9 & cancel & Cancel with nothing on file. \\
+10 & conflict & Second caller wants a taken slot, is refused, books another. \\
+11 & ambiguous & ``sometime in the morning'' re-asks rather than guessing. \\
+12 & ambiguous & ``later this week'' re-asks; concrete date then accepted. \\
+13 & unclear & Silence once, recovers; \code{retry\_count} back to 0. \\
+14 & unclear & Four unusable turns: retry cap fires, handoff. \\
+15 & abandoned & Twilio status callback marks an incomplete call abandoned. \\
+16 & book & 7am confirmed, rejected as too early, corrected to 9am. \\
+17 & book & 9pm confirmed, rejected as too late, corrected to 4pm. \\
+18 & book & Today 10am (past, vs \code{FIXED\_NOW} 13:00), rejected, corrected. \\
+19 & conflict & \textbf{9:00 and 9:30 both book.} The half-open boundary. \\
+20 & conflict & 10:15 overlaps a 10:00 slot; refused; 11:00 accepted. \\
+21 & book & Mid-call switch from book to cancel; slots wiped. \\
+22 & book & Two callers, two slots, independent. \\
+23 & book & Goodbye after success does \emph{not} overwrite \code{booked}. \\
+24 & unclear & Turn cap fires with \code{retry\_count == 0}. \\
+25 & conflict & Reschedule into a taken slot; refused; alternate accepted. \\
+\bottomrule
+\end{tabular}
+\caption{The 25 scenarios. 16, 17 and 18 each contain a deliberate extra ``yes'', because
+validation only runs after confirmation; without it the scenario would pass without ever
+executing the code it is named for.}
+\end{table}
+
+\subsection{Do the scenarios have teeth? A verification of the verification}
+
+A passing test proves nothing unless it can fail. The README claims the caps were deliberately
+broken to check the tests noticed. That claim was independently re-tested for this document, by
+copying the project to a scratch directory and sabotaging it there (the repository itself was
+never modified):
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Sabotage applied} & \textbf{Result} & \textbf{Scenario that caught it} \\
+\midrule
+\code{MAX\_RETRY\_COUNT} 3 $\rightarrow$ 999 & 24/25 & \code{unclear\_speech\_retry\_cap\_handoff} \\
+\code{MAX\_TURN\_COUNT} 14 $\rightarrow$ 9999 & 24/25 & \code{max\_turn\_cap\_handoff} \\
+\code{<} $\rightarrow$ \code{<=} in \code{\_overlaps} & 24/25 & \code{boundary\_adjacent\_appointments\_no\_conflict} \\
+\bottomrule
+\end{tabular}
+\caption{Mutation testing, performed for this document. Each sabotage killed exactly the one
+scenario named for it, and no others. The scenarios are load-bearing, not decorative.}
+\end{table}
+
+\begin{jargon}{Mutation testing}
+Deliberately introducing a bug to check that the test suite fails. It tests the tests. If you
+break the code and everything still passes, your tests were measuring nothing. The precision
+here (each mutation killed exactly one scenario, no collateral) is a sign of well-targeted
+tests.
+\end{jargon}
+
+\subsection{The scripted engine}
+
+Roughly a dozen regexes over keywords: \code{\_BOOK\_KW}, \code{\_CANCEL\_KW},
+\code{\_YES\_KW}, plus extractors for names, phones, times, dates and durations. Its
+resolution order matters:
+
+\begin{lstlisting}[language=Python,caption={Intent resolution, in priority order}]
+if _CANCEL_KW.search(utterance):        new_intent = "cancel"
+elif _RESCHEDULE_KW.search(utterance):  new_intent = "reschedule"
+elif _BOOK_KW.search(utterance):        new_intent = "book"
+elif _GOODBYE_KW.search(utterance):     new_intent = "goodbye"
+...
+if new_intent is not None:                     intent = new_intent
+elif ctx.current_action is not None and (extracted_anything or vague_answer):
+    intent = ctx.current_action    # a continuation of what we were doing
+else:
+    intent = "unclear"             # drives the retry path
+\end{lstlisting}
+
+The \code{vague\_answer} branch is the clever part. ``Sometime in the morning'' extracts no
+usable slot, but it is not gibberish either, and conflating the two would make scenario 24
+untestable: a real answer that happens to be unhelpful must re-ask \emph{without} incrementing
+the retry counter.
+
+\begin{honest}{The scripted engine flatters the state machine, unavoidably}
+This is worth naming clearly because it bounds what ``25/25'' means. The scripted engine was
+written \emph{after} the scenarios, to understand exactly the phrases those scenarios use. Its
+own docstring admits this: ``its natural-language coverage only needs to be as good as the
+phrases the scenarios use''. So the 25 scenarios can never surface a misunderstanding, because
+the fake model never misunderstands anything; the sentences and the parser were built for each
+other.
+
+That is the correct trade (the alternative is 100+ billed calls per run, and flaky tests), and
+the project is open about it. But it means the scenarios test the state machine \emph{given
+perfect understanding}. Real understanding is tested only by the 6 marked Gemini tests, against
+clean typed English. Nothing here tests messy speech-to-text output. The right framing under
+questioning: ``25/25 proves the booking logic is correct, and I deliberately made the
+understanding layer a separate, smaller, honest experiment.''
+\end{honest}
+
+Note too that the parsers are duplicated in spirit: \code{ScriptedIntentEngine} reimplements
+relative-date logic (``tomorrow'', ``next Tuesday'') that the Gemini prompt asks the model to
+do. Two implementations of one rule can drift, though only the Gemini one ships.
+
+\section{Testing: what was verified, and how}
+
+\subsection{The reported numbers, independently reproduced}
+
+Every count below was re-verified for this document by installing the pinned requirements into
+a brand new virtual environment and running the suite. The free suite was run in full; the
+billed suite was collected but \textbf{deliberately never executed}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Claim in the README} & \textbf{Observed} & \textbf{Verdict} \\
+\midrule
+54 tests collected & \code{54 tests collected in 0.72s} & confirmed \\
+47 run free, 7 billed & \code{47 passed, 7 deselected} & confirmed \\
+7 marked \code{real\_api} & \code{7/54 tests collected (47 deselected)} & confirmed, \emph{not run} \\
+25/25 scenarios pass & \code{25/25 scenarios passed} & confirmed \\
+Installs into a clean venv & installed, exit code 0 & confirmed \\
+6 real Gemini calls & 6 test functions, 1 call each & \emph{inferred from source} \\
+1.8 s with thinking off & no artefact in the repository & \emph{unverifiable here} \\
+Live tunnel booking & no artefact in the repository & \emph{unverifiable here} \\
+\bottomrule
+\end{tabular}
+\caption{Verification of the README's own claims. The free numbers all hold exactly. The
+last three are the owner's own records of runs that left no committed evidence.}
+\label{tab:verify}
+\end{table}
+
+\begin{honest}{Three claims rest on the owner's word, not on anything in the repository}
+Stated plainly so they are not defended as if verified:
+
+\textbf{The 1.8 second latency measurement} and the ``56 thinking tokens'' figure appear only
+in README prose. No script, log, or artefact reproduces them. They are plausible and specific,
+but a sceptical interviewer cannot check them, and neither could this review.
+
+\textbf{The live public-tunnel run} (the \code{localhost.run} tunnel, the genuinely
+HMAC-signed requests, the row written to the database and then deleted) is the strongest
+verification claimed, and nothing of it survives in the repository: no log, no transcript, no
+recording. It was, by design, cleaned up afterwards.
+
+\textbf{The Gemini cost figure} is explicitly labelled in the README as ``an estimate from
+per-token rates, not a verified line-item invoice'', which is exactly the right way to say it.
+
+None of this suggests the claims are untrue; the README's overall precision argues strongly the
+other way, and its willingness to flag its own estimate as an estimate is a good sign. But the
+distinction between ``I ran this and here is the artefact'' and ``I ran this and cleaned up''
+is one an interviewer may probe. The cheap fix, for next time, is to commit the log.
+\end{honest}
+
+\subsection{The coverage map}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{
+\begin{tikzpicture}[node distance=5mm]
+  \node[box, fill=okgreen!15, draw=okgreen, text width=34mm] (a) {\textbf{calendar\_store.py}\\{\scriptsize 13 tests, no network}\\{\scriptsize + 25 scenarios}};
+  \node[box, fill=okgreen!15, draw=okgreen, text width=34mm, right=5mm of a] (b) {\textbf{conversation.py}\\{\scriptsize 25 scenarios}\\{\scriptsize + endpoint tests}};
+  \node[box, fill=okgreen!15, draw=okgreen, text width=34mm, right=5mm of b] (c) {\textbf{session\_store.py}\\{\scriptsize exercised throughout}};
+  \node[box, fill=okgreen!15, draw=okgreen, text width=34mm, right=5mm of c] (d) {\textbf{app.py / twiml.py}\\{\scriptsize 7 TestClient tests}};
+
+  \node[box, fill=accent!15, draw=accent, text width=34mm, below=7mm of a] (e) {\textbf{GeminiIntentEngine}\\{\scriptsize 6 REAL billed tests,}\\{\scriptsize clean typed English only}};
+  \node[box, fill=accent!15, draw=accent, text width=34mm, below=7mm of b] (f) {\textbf{Twilio signature}\\{\scriptsize real token, local HMAC,}\\{\scriptsize no network}};
+  \node[box, fill=warnred!12, draw=warnred, text width=34mm, below=7mm of c] (g) {\textbf{GoogleCalendarStore}\\{\scriptsize NEVER RUN}\\{\scriptsize no credentials provided}};
+  \node[box, fill=warnred!12, draw=warnred, text width=34mm, below=7mm of d] (h) {\textbf{A real human voice call}\\{\scriptsize NEVER DONE}\\{\scriptsize needs a live tunnel + phone}};
+
+  \node[lbl, left=3mm of a, text width=17mm] {\textbf{free +}\\\textbf{thorough}};
+  \node[lbl, left=3mm of e, text width=17mm] {\textbf{narrow but}\\\textbf{real}};
+\end{tikzpicture}}
+\caption{Green: covered free and well. Blue: covered by a small, deliberate, real-API slice.
+Red: not covered, and the README says so in both cases.}
+\end{figure}
+
+\section{Honest findings}
+\label{sec:findings}
+
+Everything below was found by reading the source, and each was confirmed by executing the real
+code in a scratch copy. None of it appears in the README.
+
+\begin{honest}{Finding 1: the wrong appointment is cancelled when a caller has two}
+\code{\_find\_target\_appointment} takes the first match:
+
+\begin{lstlisting}[language=Python]
+matches = self.calendar_store.list_by_phone(phone, active_only=True)
+return matches[0] if matches else None
+\end{lstlisting}
+
+and \code{list\_by\_phone} sorts \code{ORDER BY start\_time DESC}, meaning \emph{furthest
+future first}. So a caller with an appointment tomorrow and another next month who says
+``cancel my appointment'' gets \textbf{next month's cancelled}, and tomorrow's silently
+retained. Verified directly: booking 2026-08-01 and 2026-09-01 under one number and asking for
+the target returns the September one.
+
+The agent does read the date back (``I found your appointment for Tuesday September 1st,
+should I cancel it?''), so an attentive caller can say no. But the default is wrong: ``my
+appointment'' in ordinary speech means the next one. No scenario covers a caller with two
+active appointments, which is exactly why the suite is green. The fix is \code{ASC} ordering
+plus a filter to future appointments; the deeper fix is asking which one.
+\end{honest}
+
+\begin{honest}{Finding 2: phone numbers are stored in two incompatible formats}
+Twilio supplies caller ID in E.164 (\code{+15551112222}). The scripted engine strips speech to
+bare digits (\code{5551112222}). \code{conversation.py} fills the slot from whichever it has:
+
+\begin{lstlisting}[language=Python]
+if not session.slots.get("phone"):
+    session.slots["phone"] = session.caller_number    # E.164 from Twilio
+\end{lstlisting}
+
+and \code{list\_by\_phone} does an exact string match. So an appointment booked after the
+caller \emph{spoke} their number is stored under \code{5551112222} and is \textbf{unfindable}
+when that same person phones back, because lookup then uses \code{+15551112222}. Verified:
+booking under the spoken form and looking up the E.164 form returns 0 matches. Cancelling by
+phone would fail for exactly the caller who was most helpful.
+
+The sharpest part: scenario 4 (\code{book\_explicit\_phone\_override}) \emph{asserts this
+behaviour as correct}, checking \code{len(by\_caller\_id) == 0}. The test locks the bug in. Its
+intent (a spoken number should win over caller ID) is right; what is missing is normalising
+both to one canonical format on the way in. This is a good illustration of a test that
+encodes an assumption rather than a requirement.
+\end{honest}
+
+\begin{honest}{Finding 3: cancelling an already-cancelled appointment silently succeeds}
+The \code{CalendarStore} interface says \code{cancel} ``Raises NotFoundError''.
+\code{SqliteCalendarStore.reschedule} does check status:
+
+\begin{lstlisting}[language=Python]
+existing = self.get(appointment_id)
+if existing.status != "booked":
+    raise NotFoundError(f"Appointment {appointment_id} is not active ...")
+\end{lstlisting}
+
+but \code{cancel} performs no such check and simply re-runs the \code{UPDATE}. Verified:
+cancelling twice returns \code{status='cancelled'} both times with no error. The effect is
+benign (the operation is idempotent, and arguably that is even desirable), but it is an
+inconsistency between two sibling methods and a divergence from the documented contract. Worth
+knowing which way you would resolve it.
+\end{honest}
+
+\begin{honest}{Finding 4: small dead code}
+\begin{itemize}
+  \item \code{SessionState.stage} is declared with a comment describing a lifecycle
+  (\code{start -> collecting -> confirming -> done}) and is \textbf{never read or written
+  anywhere}. It is serialised into every session row regardless. A grep for \code{stage} across
+  the codebase returns exactly one hit: the declaration. It is a leftover from an earlier
+  design that the \code{action} plus \code{slots} pair replaced.
+  \item \code{\_handle\_cancel(self, session, model\_reply)} never uses \code{model\_reply};
+  every return path writes its own sentence. Harmless, but it implies a symmetry with
+  \code{\_handle\_book} that does not exist.
+  \item \code{TurnOutcome.outcome} is populated carefully on every terminal path and
+  \code{app.py} never reads it; only the tests and the eval harness do, and via
+  \code{session.outcome} rather than the returned object.
+  \item \code{DEEPGRAM\_API\_KEY} sits in \file{.env.example} and appears nowhere in the code.
+  The file says so explicitly (``not wired into the code yet''), which makes it honest rather
+  than misleading, but it is still an unused knob.
+\end{itemize}
+\end{honest}
+
+\begin{honest}{Finding 5: \code{strftime("\%-I:\%M \%p")} is not portable}
+Every caller-facing date uses the \code{\%-d} / \code{\%-I} form to strip a leading zero
+(``at 2:00 PM'' rather than ``at 02:00 PM''). That hyphen flag is a glibc extension. It works
+on Linux and macOS and raises \code{ValueError} on Windows. This project is very unlikely to
+run on Windows, so it is a note rather than a defect, but it is the kind of thing that turns a
+cosmetic detail into a crash in a caller-facing sentence.
+\end{honest}
+
+\begin{honest}{Finding 6: SQLite concurrency, acknowledged but worth being precise about}
+The README correctly flags SQLite as single-writer. Two specifics sharpen it. Both stores open
+their connection with \code{check\_same\_thread=False}, which switches off Python's own
+safety check that a connection is not shared across threads; FastAPI serves requests from a
+thread pool, so concurrent requests genuinely can share that connection object.
+
+More interestingly, \code{book()} does \code{find\_conflict()} and then \code{INSERT} as two
+separate statements with no transaction around them. Two simultaneous calls could both find no
+conflict and both insert: a double booking, despite the conflict check. One phone line makes
+this vanishingly unlikely, and it is the right call not to have solved it. But ``why is your
+conflict check not atomic?'' is a fair question, and the answer (wrap both in a single
+transaction, or add a database-level constraint) is worth having ready.
+\end{honest}
+
+\begin{jargon}{Race condition}
+A bug where the result depends on the accidental timing of two things happening at once.
+Finding 6 is the classic ``check then act'' race: the fact you checked (no conflict) can stop
+being true between checking and acting on it.
+\end{jargon}
+
+\section{Security review}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}lp{9.4cm}@{}}
+\toprule
+\textbf{Check} & \textbf{Result} \\
+\midrule
+Secrets in the working tree & \textbf{None.} \file{.env} is a symbolic link pointing outside
+the repository entirely, to a private secrets directory. \\
+Secrets in git history & \textbf{None.} All 46 objects across the full history were scanned for
+Twilio SIDs, Google API keys, private key blocks and hard-coded tokens. Clean. \\
+\file{.env.example} & Placeholders only (\code{ACyour-account-sid-here}). No real value. \\
+\file{.gitignore} & Covers \file{.env}, \code{service-account*.json}, \code{*.pem},
+\code{*.db}, \code{data/}. Appropriate. \\
+SQL injection & Every query is parameterised. No string-built SQL anywhere. \\
+Credential logging & \code{config.py} never logs values. The Gemini error path logs the
+exception, not the credential. \\
+Webhook authentication & \textbf{Fails open by default.} See the finding in the \code{app.py}
+section: the single most important issue found. \\
+\bottomrule
+\end{tabular}
+\caption{Security posture. Secret hygiene is genuinely good and follows the portfolio's own
+rule that credentials live outside the folder.}
+\end{table}
+
+\section{Dependencies, and why each is there}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{6.5cm}@{}}
+\toprule
+\textbf{Package} & \textbf{Pin} & \textbf{Role} \\
+\midrule
+\code{fastapi} & 0.139.0 & The web framework Twilio's webhooks hit. \\
+\code{uvicorn[standard]} & 0.50.2 & The server that actually runs FastAPI. \\
+\code{python-multipart} & 0.0.32 & Parses form-encoded bodies. Twilio posts forms, not JSON,
+so without this \code{await request.form()} fails. \\
+\code{twilio} & 9.10.9 & TwiML builders, \code{RequestValidator}, and the REST client. \\
+\code{google-genai} & 2.10.0 & The Gemini SDK, via Vertex AI. \\
+\code{google-auth} & 2.55.1 & Service-account authentication. \\
+\code{google-api-python-client} & 2.198.0 & Only for the optional Google Calendar adapter. \\
+\code{python-dotenv} & 1.2.2 & Loads \file{.env} into the environment. \\
+\code{pytest} & 9.1.1 & The test runner. \\
+\code{httpx} & 0.28.1 & Required by FastAPI's \code{TestClient}. \\
+\bottomrule
+\end{tabular}
+\caption{All ten dependencies are pinned to exact versions, which is right for reproducibility.
+Installation into a clean virtual environment was verified for this document.}
+\end{table}
+
+\begin{jargon}{Pinning}
+Recording the exact version (\code{==0.139.0}) rather than a range. It means the code you tested
+is the code that runs. The cost is that upgrades become deliberate work, which for a portfolio
+project is the right trade.
+\end{jargon}
+
+Note that \code{google-api-python-client} is installed for everyone but used only by the
+unverified Google Calendar adapter. Correspondingly, \code{calendar\_store.py} imports it
+lazily inside \code{\_\_init\_\_}, so the code is at least consistent with treating it as
+optional.
+
+\section{What to be ready to say about this project}
+
+\begin{keyidea}{The strongest things here}
+\begin{enumerate}
+  \item \textbf{The interface seam.} Two small abstract classes turn an untestable,
+  expensive, non-deterministic system into one with 47 free deterministic tests plus 25 free
+  scenarios. This is the single best thing in the project and the easiest to defend.
+  \item \textbf{Turning the LLM's flagship feature off.} Recognising that thinking mode is
+  wrong for a live phone turn, measuring it, and disabling it, is real product engineering
+  rather than cargo-culted best practice.
+  \item \textbf{The tests were tested.} The mutation testing claim in the README is true; it
+  was reproduced here. Each sabotage killed exactly its own scenario.
+  \item \textbf{Two safety caps for two different failures}, with a test that proves \emph{which}
+  one fired.
+  \item \textbf{Reading the vendor documentation properly.} The \code{actionOnEmptyResult}
+  discovery is exactly the class of detail that separates working telephony from a demo.
+  \item \textbf{The README's honesty.} It is more candid about its own gaps than most
+  production documentation.
+\end{enumerate}
+\end{keyidea}
+
+\begin{keyidea}{The things to raise before an interviewer finds them}
+\begin{enumerate}
+  \item \textbf{The signature check fails open} without \code{PUBLIC\_WEBHOOK\_BASE\_URL}.
+  Know the fix: refuse to start, or make unsigned an explicit opt-in.
+  \item \textbf{Two phone number formats}, and a test that locks the bug in. Normalise on the
+  way in.
+  \item \textbf{The furthest-future appointment is targeted}, not the soonest.
+  \item \textbf{The scripted engine cannot fail to understand}, so ``25/25'' means the logic is
+  right given perfect understanding. Say so first; it is a strength that you know it.
+  \item \textbf{No timezones at all}, acknowledged in the README.
+  \item \textbf{The Google adapter has never run}, and reading it reveals the \code{cancel()}
+  return-value defect.
+  \item \textbf{The live tunnel run left no artefact.} Be ready to describe it precisely.
+\end{enumerate}
+\end{keyidea}
+
+\vfill
+\begin{center}
+\small\itshape
+Built from the repository source. Every claim above is either quoted from the code, verified by
+running it in an isolated scratch copy, or explicitly labelled as inferred or unverifiable.
+No phone call was placed and no billed API test was executed in the making of this document.
+\end{center}
+
+\end{document}
